@@ -1,15 +1,10 @@
-import os
 import requests
 from datetime import datetime
 
-# 从环境变量读取 API Key（你需要在 GitHub Secrets 中添加）
-API_KEY = os.getenv("STEAMDB_API_KEY")
-# Anysite 的 SteamDB 促销信息 API 端点（根据官方文档确认）
-API_URL = "https://api.anysite.io/v1/steamdb/promotions"
-
 def fetch_free_games():
     """
-    通过 Anysite API 获取 SteamDB 即将免费的游戏列表
+    通过 GamerPower 免费 API 获取即将免费的游戏列表
+    仅筛选 Steam 平台的游戏
     返回列表，每个元素为 dict：
     {
         'name': str,
@@ -20,83 +15,85 @@ def fetch_free_games():
         'promotion_type': str
     }
     """
-    if not API_KEY:
-        raise ValueError(
-            "STEAMDB_API_KEY 未设置！请到 https://anysite.io/ 注册并获取 API Key，"
-            "然后在 GitHub Secrets 中添加 STEAMDB_API_KEY。"
-        )
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Accept": "application/json"
-    }
-    # 可选的查询参数，根据文档调整，例如 filter=upcoming
+    # GamerPower 免费 API 端点，无需 API Key
+    url = "https://www.gamerpower.com/api/freebies"
     params = {
-        "filter": "upcoming"   # 仅获取即将到来的免费游戏
+        "type": "game",        # 只获取游戏类型（不包含 DLC、皮肤等）
+        "platform": "steam",   # 只获取 Steam 平台的游戏
+        "sort-by": "date"      # 按日期排序
     }
 
     try:
-        resp = requests.get(API_URL, headers=headers, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.RequestException as e:
         raise Exception(f"API 请求失败: {e}")
 
-    # 根据 Anysite API 实际返回结构解析（以下为示例，请根据真实响应调整）
-    # 通常返回格式：{ "status": "success", "data": [ {...}, ... ] }
-    items = data.get("data", [])
-    if not items:
-        # 有些 API 可能直接返回列表，尝试兼容
-        items = data if isinstance(data, list) else []
+    if not data:
+        raise Exception("API 返回空数据，请稍后重试")
 
     games = []
-    for item in items:
-        # 字段名可能需要根据文档调整
-        name = item.get("name") or item.get("title") or ""
-        url = item.get("url") or ""
-        image = item.get("image") or item.get("thumbnail") or ""
-        promo = item.get("promotion_type") or item.get("type") or "Free"
+    for item in data:
+        # 只处理即将到来的免费游戏（status 为 'Coming Soon' 或 'Active'）
+        status = item.get("status", "")
+        if status not in ["Coming Soon", "Active"]:
+            continue
 
-        # 时间字段可能为 timestamp 或 ISO 字符串
-        start_ts = item.get("start_date") or item.get("start_time")
-        end_ts = item.get("end_date") or item.get("end_time")
+        # 提取游戏信息
+        name = item.get("title", "未知游戏")
+        # GamerPower 返回的是 giveaway 页面，但我们构建 SteamDB 链接
+        # 如果 item 有 open_giveaway 字段，使用它，否则构建 SteamDB 搜索链接
+        db_url = item.get("open_giveaway", "")
+        if not db_url:
+            # 如果 API 返回了 steam_id，可以构建 SteamDB 链接
+            steam_id = item.get("steam_id", "")
+            if steam_id:
+                db_url = f"https://steamdb.info/app/{steam_id}/"
+            else:
+                db_url = f"https://store.steampowered.com/app/{item.get('id', '')}"
 
-        start_dt = parse_time(start_ts)
-        end_dt = parse_time(end_ts)
+        # 图片 URL
+        image_url = item.get("thumbnail", "")
+        if not image_url:
+            image_url = item.get("image", "")
+
+        # 解析时间
+        start_dt = parse_gamerpower_time(item.get("published_date"))
+        end_dt = parse_gamerpower_time(item.get("end_date"))
+
+        # 促销类型
+        giveaway_type = item.get("type", "Free")
+        if giveaway_type == "Free Game":
+            promo_type = "Free to Keep"
+        else:
+            promo_type = giveaway_type
 
         games.append({
             'name': name,
-            'url': url,
-            'image': image,
+            'url': db_url,
+            'image': image_url,
             'start_time': start_dt,
             'end_time': end_dt,
-            'promotion_type': promo
+            'promotion_type': promo_type
         })
 
     return games
 
-def parse_time(value):
-    """尝试将各种格式的时间转换为 datetime 对象"""
+
+def parse_gamerpower_time(value):
+    """解析 GamerPower API 返回的时间格式"""
     if not value:
         return None
-    # 如果是整数时间戳（秒级）
-    if isinstance(value, (int, float)):
+    # GamerPower 返回的是 ISO 格式: 2026-08-10T00:00:00.000Z
+    try:
+        # 移除毫秒部分处理
+        if '.' in value:
+            value = value.split('.')[0] + 'Z'
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        # 尝试其他格式
         try:
-            return datetime.fromtimestamp(value)
-        except:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
             return None
-    # 如果是 ISO 格式字符串
-    if isinstance(value, str):
-        # 尝试常见 ISO 格式
-        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-            try:
-                return datetime.strptime(value, fmt)
-            except ValueError:
-                continue
-        # 如果包含时区，尝试简单去除后处理
-        if "T" in value:
-            try:
-                return datetime.fromisoformat(value.replace('Z', '+00:00'))
-            except:
-                pass
-    return None
