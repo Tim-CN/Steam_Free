@@ -56,13 +56,16 @@ def send_email(games):
 
     # 发送
     try:
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        # 对于 Outlook，使用端口 587 和 STARTTLS
+        if SMTP_PORT == 587:
+            # 创建一个不安全的 SMTP 连接，然后升级为 TLS
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                server.starttls()  # <-- 关键：启用 STARTTLS 加密
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SMTP_USER, [RECEIVER], msg.as_string())
         else:
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-                server.starttls()
+            # 对于其他使用 SSL 的邮箱 (如 QQ 的 465 端口)
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SMTP_USER, [RECEIVER], msg.as_string())
         print("邮件发送成功")
