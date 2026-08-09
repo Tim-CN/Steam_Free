@@ -1,10 +1,11 @@
-import requests
+import cloudscraper
+from bs4 import BeautifulSoup
 from datetime import datetime
+import time
 
 def fetch_free_games():
     """
-    通过 GamerPower 免费 API 获取即将免费的游戏列表
-    仅筛选 Steam 平台的游戏
+    使用 cloudscraper 绕过 Cloudflare 保护，从 SteamDB 获取即将免费的游戏列表
     返回列表，每个元素为 dict：
     {
         'name': str,
@@ -15,85 +16,98 @@ def fetch_free_games():
         'promotion_type': str
     }
     """
-    # GamerPower 免费 API 端点，无需 API Key
-    url = "https://www.gamerpower.com/api/freebies"
-    params = {
-        "type": "game",        # 只获取游戏类型（不包含 DLC、皮肤等）
-        "platform": "steam",   # 只获取 Steam 平台的游戏
-        "sort-by": "date"      # 按日期排序
+    url = "https://steamdb.info/upcoming/free/"
+    
+    # 创建 cloudscraper 实例，模拟 Chrome 浏览器
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        }
+    )
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://steamdb.info/",
+        "Connection": "keep-alive",
     }
-
+    
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = scraper.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"API 请求失败: {e}")
-
-    if not data:
-        raise Exception("API 返回空数据，请稍后重试")
-
+    except Exception as e:
+        raise Exception(f"SteamDB 抓取失败: {e}")
+    
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    
+    # 定位表格（SteamDB 使用 class 'table-products'）
+    table = soup.find('table', class_='table-products')
+    if not table:
+        # 尝试直接找 tbody
+        table = soup.find('tbody')
+    if not table:
+        raise Exception("无法找到数据表格，页面结构可能已变化")
+    
+    rows = table.find_all('tr')
     games = []
-    for item in data:
-        # 只处理即将到来的免费游戏（status 为 'Coming Soon' 或 'Active'）
-        status = item.get("status", "")
-        if status not in ["Coming Soon", "Active"]:
+    
+    for row in rows:
+        # 提取游戏名称和链接
+        name_tag = row.find('a', class_='b')
+        if not name_tag:
             continue
-
-        # 提取游戏信息
-        name = item.get("title", "未知游戏")
-        # GamerPower 返回的是 giveaway 页面，但我们构建 SteamDB 链接
-        # 如果 item 有 open_giveaway 字段，使用它，否则构建 SteamDB 搜索链接
-        db_url = item.get("open_giveaway", "")
-        if not db_url:
-            # 如果 API 返回了 steam_id，可以构建 SteamDB 链接
-            steam_id = item.get("steam_id", "")
-            if steam_id:
-                db_url = f"https://steamdb.info/app/{steam_id}/"
-            else:
-                db_url = f"https://store.steampowered.com/app/{item.get('id', '')}"
-
-        # 图片 URL
-        image_url = item.get("thumbnail", "")
-        if not image_url:
-            image_url = item.get("image", "")
-
-        # 解析时间
-        start_dt = parse_gamerpower_time(item.get("published_date"))
-        end_dt = parse_gamerpower_time(item.get("end_date"))
-
-        # 促销类型
-        giveaway_type = item.get("type", "Free")
-        if giveaway_type == "Free Game":
-            promo_type = "Free to Keep"
-        else:
-            promo_type = giveaway_type
-
+        name = name_tag.get_text(strip=True)
+        relative_url = name_tag.get('href')
+        full_url = f"https://steamdb.info{relative_url}" if relative_url else ""
+        
+        # 提取图片（可能不存在）
+        img_tag = row.find('img')
+        image_url = img_tag.get('src') if img_tag else ""
+        
+        # 提取所有 td
+        tds = row.find_all('td')
+        if len(tds) < 4:
+            continue
+        
+        # 促销类型（第二个 td）
+        promo_type = tds[1].get_text(strip=True) if len(tds) > 1 else "Free"
+        
+        # 开始和结束时间（第3、4个 td）
+        start_text = tds[2].get_text(strip=True) if len(tds) > 2 else ""
+        end_text = tds[3].get_text(strip=True) if len(tds) > 3 else ""
+        
+        start_dt = parse_steamdb_datetime(start_text)
+        end_dt = parse_steamdb_datetime(end_text)
+        
         games.append({
             'name': name,
-            'url': db_url,
+            'url': full_url,
             'image': image_url,
             'start_time': start_dt,
             'end_time': end_dt,
             'promotion_type': promo_type
         })
-
+    
     return games
 
 
-def parse_gamerpower_time(value):
-    """解析 GamerPower API 返回的时间格式"""
-    if not value:
+def parse_steamdb_datetime(text):
+    """解析 SteamDB 的时间格式，例如 '2026-08-10 01:00:00' 或 'Aug 10, 2026 01:00'"""
+    if not text or text == '-':
         return None
-    # GamerPower 返回的是 ISO 格式: 2026-08-10T00:00:00.000Z
-    try:
-        # 移除毫秒部分处理
-        if '.' in value:
-            value = value.split('.')[0] + 'Z'
-        return datetime.fromisoformat(value.replace('Z', '+00:00'))
-    except ValueError:
-        # 尝试其他格式
+    text = text.strip()
+    formats = [
+        '%Y-%m-%d %H:%M:%S',
+        '%b %d, %Y %H:%M',
+        '%B %d, %Y %H:%M',
+        '%Y-%m-%d',
+    ]
+    for fmt in formats:
         try:
-            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            return datetime.strptime(text, fmt)
         except ValueError:
-            return None
+            continue
+    return None
